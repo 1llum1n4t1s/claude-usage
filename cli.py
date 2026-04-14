@@ -16,6 +16,11 @@ from datetime import datetime, date
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
+TOKENS_PER_MILLION = 1_000_000
+# Anthropic キャッシュ料金: read = input の 10%、write = input の 125%
+CACHE_READ_RATIO = 0.10
+CACHE_WRITE_RATIO = 1.25
+
 PRICING = {
     "claude-opus-4-6":   {"input":  5.00, "output": 25.00},
     "claude-opus-4-5":   {"input":  5.00, "output": 25.00},
@@ -47,16 +52,17 @@ def calc_cost(model, inp, out, cache_read, cache_creation):
     p = get_pricing(model)
     if not p:
         return 0.0
+    input_price = p["input"]
     return (
-        inp          * p["input"]  / 1_000_000 +
-        out          * p["output"] / 1_000_000 +
-        cache_read   * p["input"]  * 0.10 / 1_000_000 +
-        cache_creation * p["input"] * 1.25 / 1_000_000
+        inp            * input_price                      / TOKENS_PER_MILLION +
+        out            * p["output"]                      / TOKENS_PER_MILLION +
+        cache_read     * input_price * CACHE_READ_RATIO   / TOKENS_PER_MILLION +
+        cache_creation * input_price * CACHE_WRITE_RATIO  / TOKENS_PER_MILLION
     )
 
 def fmt(n):
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.2f}M"
+    if n >= TOKENS_PER_MILLION:
+        return f"{n/TOKENS_PER_MILLION:.2f}M"
     if n >= 1_000:
         return f"{n/1_000:.1f}K"
     return str(n)
@@ -198,14 +204,12 @@ def cmd_stats():
     daily_avg = conn.execute("""
         SELECT
             AVG(daily_inp) as avg_inp,
-            AVG(daily_out) as avg_out,
-            AVG(daily_cost) as avg_cost
+            AVG(daily_out) as avg_out
         FROM (
             SELECT
                 substr(timestamp, 1, 10) as day,
                 SUM(input_tokens) as daily_inp,
-                SUM(output_tokens) as daily_out,
-                0.0 as daily_cost
+                SUM(output_tokens) as daily_out
             FROM turns
             WHERE timestamp >= datetime('now', '-30 days')
             GROUP BY day

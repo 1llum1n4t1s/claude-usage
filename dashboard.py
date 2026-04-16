@@ -126,7 +126,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
 <style>
   :root {
     /* 和紙 (washi) 風パレット */
@@ -792,14 +792,8 @@ let rawData = null;
 let selectedModels = new Set();
 let selectedRange = '30d';
 let charts = {};
-let sessionSortCol = 'last';
-let modelSortCol = 'cost';
-let modelSortDir = 'desc';
-let projectSortCol = 'cost';
-let projectSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByProject = [];
-let sessionSortDir = 'desc';
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
@@ -978,42 +972,52 @@ function updateURL() {
   history.replaceState(null, '', window.location.pathname + search);
 }
 
-// ── Session sort ───────────────────────────────────────────────────────────
-function setSessionSort(col) {
-  if (sessionSortCol === col) {
-    sessionSortDir = sessionSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    sessionSortCol = col;
-    sessionSortDir = 'desc';
-  }
-  updateSortIcons();
-  applyFilter();
-}
-
-function updateSortIcons() {
-  document.querySelectorAll('.sort-icon').forEach(el => el.textContent = '');
-  const icon = document.getElementById('sort-icon-' + sessionSortCol);
-  if (icon) icon.textContent = sessionSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortSessions(sessions) {
-  return [...sessions].sort((a, b) => {
-    let av, bv;
-    if (sessionSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
-    } else if (sessionSortCol === 'duration_min') {
-      av = parseFloat(a.duration_min) || 0;
-      bv = parseFloat(b.duration_min) || 0;
-    } else {
-      av = a[sessionSortCol] ?? 0;
-      bv = b[sessionSortCol] ?? 0;
+// ── Generic sort controller ────────────────────────────────────────────────
+// 3 組の setXSort/updateXSortIcons/sortX を統合
+function createSortCtrl(prefix, defaultCol, defaultDir) {
+  let col = defaultCol, dir = defaultDir;
+  return {
+    get col() { return col; },
+    get dir() { return dir; },
+    set(newCol) {
+      if (col === newCol) { dir = dir === 'desc' ? 'asc' : 'desc'; }
+      else { col = newCol; dir = 'desc'; }
+      this.updateIcons();
+      applyFilter();
+    },
+    updateIcons() {
+      document.querySelectorAll(`[id^="${prefix}"]`).forEach(el => el.textContent = '');
+      const icon = document.getElementById(prefix + col);
+      if (icon) icon.textContent = dir === 'desc' ? ' \u25bc' : ' \u25b2';
+    },
+    sort(arr, valFn) {
+      return [...arr].sort((a, b) => {
+        const av = valFn ? valFn(a, col) : (a[col] ?? 0);
+        const bv = valFn ? valFn(b, col) : (b[col] ?? 0);
+        if (av < bv) return dir === 'desc' ? 1 : -1;
+        if (av > bv) return dir === 'desc' ? -1 : 1;
+        return 0;
+      });
     }
-    if (av < bv) return sessionSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return sessionSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
+  };
 }
+
+const sessionSortCtrl = createSortCtrl('sort-icon-', 'last', 'desc');
+const modelSortCtrl   = createSortCtrl('msort-', 'cost', 'desc');
+const projectSortCtrl = createSortCtrl('psort-', 'cost', 'desc');
+
+// onclick ハンドラ（HTML から呼び出し）
+function setSessionSort(col) { sessionSortCtrl.set(col); }
+function setModelSort(col)   { modelSortCtrl.set(col); }
+function setProjectSort(col) { projectSortCtrl.set(col); }
+
+
+function sessionValFn(item, col) {
+  if (col === 'cost') return calcCost(item.model, item.input, item.output, item.cache_read, item.cache_creation);
+  if (col === 'duration_min') return parseFloat(item.duration_min) || 0;
+  return item[col] ?? 0;
+}
+function sortSessions(sessions) { return sessionSortCtrl.sort(sessions, sessionValFn); }
 
 // ── Aggregation & filtering ────────────────────────────────────────────────
 function applyFilter() {
@@ -1221,38 +1225,11 @@ function renderSessionsTable(sessions) {
   }).join('');
 }
 
-function setModelSort(col) {
-  if (modelSortCol === col) {
-    modelSortDir = modelSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    modelSortCol = col;
-    modelSortDir = 'desc';
-  }
-  updateModelSortIcons();
-  applyFilter();
+function modelValFn(item, col) {
+  if (col === 'cost') return calcCost(item.model, item.input, item.output, item.cache_read, item.cache_creation);
+  return item[col] ?? 0;
 }
-
-function updateModelSortIcons() {
-  document.querySelectorAll('[id^="msort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('msort-' + modelSortCol);
-  if (icon) icon.textContent = modelSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortModels(byModel) {
-  return [...byModel].sort((a, b) => {
-    let av, bv;
-    if (modelSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
-    } else {
-      av = a[modelSortCol] ?? 0;
-      bv = b[modelSortCol] ?? 0;
-    }
-    if (av < bv) return modelSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return modelSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
+function sortModels(byModel) { return modelSortCtrl.sort(byModel, modelValFn); }
 
 function renderModelCostTable(byModel) {
   document.getElementById('model-cost-body').innerHTML = sortModels(byModel).map(m => {
@@ -1272,35 +1249,10 @@ function renderModelCostTable(byModel) {
   }).join('');
 }
 
-function setProjectSort(col) {
-  if (projectSortCol === col) {
-    projectSortDir = projectSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    projectSortCol = col;
-    projectSortDir = 'desc';
-  }
-  updateProjectSortIcons();
-  applyFilter();
-}
-
-function updateProjectSortIcons() {
-  document.querySelectorAll('[id^="psort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('psort-' + projectSortCol);
-  if (icon) icon.textContent = projectSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
-}
-
-function sortProjects(byProject) {
-  return [...byProject].sort((a, b) => {
-    const av = a[projectSortCol] ?? 0;
-    const bv = b[projectSortCol] ?? 0;
-    if (av < bv) return projectSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return projectSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
+function sortProjects(byProject) { return projectSortCtrl.sort(byProject); }
 
 function renderProjectCostTable(byProject) {
-  document.getElementById('project-cost-body').innerHTML = sortProjects(byProject).map(p => {
+  document.getElementById('project-cost-body').innerHTML = byProject.map(p => {
     return `<tr>
       <td>${esc(p.project)}</td>
       <td class="num">${p.sessions}</td>
@@ -1395,9 +1347,9 @@ async function loadData() {
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
       buildFilterUI(d.all_models);
-      updateSortIcons();
-      updateModelSortIcons();
-      updateProjectSortIcons();
+      sessionSortCtrl.updateIcons();
+      modelSortCtrl.updateIcons();
+      projectSortCtrl.updateIcons();
     }
 
     applyFilter();
@@ -1425,6 +1377,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self.send_response(200)
@@ -1434,20 +1394,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/data":
             try:
-                data = get_dashboard_data()
-                body = json.dumps(data).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json(get_dashboard_data())
             except Exception as exc:
-                body = json.dumps({"error": str(exc)}).encode("utf-8")
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json({"error": str(exc)}, status=500)
 
         else:
             self.send_response(404)
@@ -1455,17 +1404,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/rescan":
-            # Full rebuild: delete DB and rescan from scratch
             if DB_PATH.exists():
                 DB_PATH.unlink()
             from scanner import scan
-            result = scan(verbose=False)
-            body = json.dumps(result).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(scan(verbose=False))
         else:
             self.send_response(404)
             self.end_headers()

@@ -5,6 +5,7 @@ scanner.py - Scans Claude Code JSONL transcript files and stores data in SQLite.
 import json
 import os
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -199,8 +200,6 @@ def parse_jsonl_file(filepath, skip_lines=0):
 
 def aggregate_sessions(session_metas, turns):
     """Aggregate turn data back into session-level stats."""
-    from collections import defaultdict
-
     session_stats = defaultdict(lambda: {
         "total_input_tokens": 0,
         "total_output_tokens": 0,
@@ -230,47 +229,29 @@ def aggregate_sessions(session_metas, turns):
 
 
 def upsert_sessions(conn, sessions):
-    for s in sessions:
-        # Check if session exists
-        existing = conn.execute(
-            "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
-            "total_cache_creation, turn_count FROM sessions WHERE session_id = ?",
-            (s["session_id"],)
-        ).fetchone()
-
-        if existing is None:
-            conn.execute("""
-                INSERT INTO sessions
-                    (session_id, project_name, first_timestamp, last_timestamp,
-                     git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                s["session_id"], s["project_name"], s["first_timestamp"],
-                s["last_timestamp"], s["git_branch"],
-                s["total_input_tokens"], s["total_output_tokens"],
-                s["total_cache_read"], s["total_cache_creation"],
-                s["model"], s["turn_count"]
-            ))
-        else:
-            # Update: add new tokens on top of existing (since we only insert new turns)
-            conn.execute("""
-                UPDATE sessions SET
-                    last_timestamp = MAX(last_timestamp, ?),
-                    total_input_tokens = total_input_tokens + ?,
-                    total_output_tokens = total_output_tokens + ?,
-                    total_cache_read = total_cache_read + ?,
-                    total_cache_creation = total_cache_creation + ?,
-                    turn_count = turn_count + ?,
-                    model = COALESCE(?, model)
-                WHERE session_id = ?
-            """, (
-                s["last_timestamp"],
-                s["total_input_tokens"], s["total_output_tokens"],
-                s["total_cache_read"], s["total_cache_creation"],
-                s["turn_count"], s["model"],
-                s["session_id"]
-            ))
+    # SQLite UPSERT (ON CONFLICT) — SELECT N 回を排除してバッチ処理
+    conn.executemany("""
+        INSERT INTO sessions
+            (session_id, project_name, first_timestamp, last_timestamp,
+             git_branch, total_input_tokens, total_output_tokens,
+             total_cache_read, total_cache_creation, model, turn_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            last_timestamp     = MAX(sessions.last_timestamp, excluded.last_timestamp),
+            total_input_tokens  = sessions.total_input_tokens  + excluded.total_input_tokens,
+            total_output_tokens = sessions.total_output_tokens + excluded.total_output_tokens,
+            total_cache_read    = sessions.total_cache_read    + excluded.total_cache_read,
+            total_cache_creation= sessions.total_cache_creation+ excluded.total_cache_creation,
+            turn_count          = sessions.turn_count          + excluded.turn_count,
+            model               = COALESCE(excluded.model, sessions.model)
+    """, [
+        (s["session_id"], s["project_name"], s["first_timestamp"],
+         s["last_timestamp"], s["git_branch"],
+         s["total_input_tokens"], s["total_output_tokens"],
+         s["total_cache_read"], s["total_cache_creation"],
+         s["model"], s["turn_count"])
+        for s in sessions
+    ])
 
 
 def insert_turns(conn, turns):

@@ -1435,11 +1435,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def _periodic_scan_loop(interval_sec):
+def _periodic_scan_loop(interval_sec, projects_dir=None):
     """バックグラウンドで定期的に scan を走らせ、キャッシュを破棄する。
 
     PC 起動時しかスキャンしていなかったため、日をまたぐと当日の統計が
     反映されなかった。ダッシュボード稼働中も自動で最新 JSONL を取り込む。
+
+    projects_dir: CLI で ``--projects-dir`` が指定された場合、初回 scan と
+    同じディレクトリを周期スキャンでも使う。None ならスキャナー既定値
+    (``DEFAULT_PROJECTS_DIRS``) を利用。
     """
     # scanner のインポートはスレッド内で行って起動時間を早める
     from scanner import scan
@@ -1447,26 +1451,41 @@ def _periodic_scan_loop(interval_sec):
     while True:
         try:
             time.sleep(interval_sec)
-            scan(verbose=False)
+            scan(projects_dir=projects_dir, verbose=False)
             _invalidate_cache()
         except Exception as exc:
             # サーバーは落とさず、次の周期で再挑戦する
             print(f"[periodic scan error] {exc}")
 
 
-def serve(host=None, port=None, scan_interval_sec=None):
+def _resolve_scan_interval(scan_interval_sec):
+    """SCAN_INTERVAL_SEC のパースを失敗に強くする。
+
+    `"300s"` のような不正値でもサーバーを落とさず、デフォルト値に
+    フォールバックする。
+    """
+    if scan_interval_sec is not None:
+        return scan_interval_sec
+    raw = os.environ.get("SCAN_INTERVAL_SEC", str(DEFAULT_SCAN_INTERVAL_SEC))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        print(f"[warn] invalid SCAN_INTERVAL_SEC={raw!r}; "
+              f"falling back to {DEFAULT_SCAN_INTERVAL_SEC}s")
+        return DEFAULT_SCAN_INTERVAL_SEC
+
+
+def serve(host=None, port=None, scan_interval_sec=None, projects_dir=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
 
-    if scan_interval_sec is None:
-        scan_interval_sec = int(os.environ.get(
-            "SCAN_INTERVAL_SEC", str(DEFAULT_SCAN_INTERVAL_SEC)
-        ))
+    scan_interval_sec = _resolve_scan_interval(scan_interval_sec)
 
     if scan_interval_sec > 0:
         t = threading.Thread(
             target=_periodic_scan_loop,
             args=(scan_interval_sec,),
+            kwargs={"projects_dir": projects_dir},
             daemon=True,
             name="claude-usage-periodic-scan",
         )

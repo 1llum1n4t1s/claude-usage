@@ -10,7 +10,13 @@ import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+from dashboard import (
+    get_dashboard_data,
+    DashboardHandler,
+    HTML_TEMPLATE,
+    _resolve_scan_interval,
+    DEFAULT_SCAN_INTERVAL_SEC,
+)
 
 try:
     from http.server import HTTPServer
@@ -181,6 +187,97 @@ class TestHTMLTemplate(unittest.TestCase):
     def test_unknown_models_return_null(self):
         """Verify getPricing returns null for non-Anthropic models."""
         self.assertIn("return null;", HTML_TEMPLATE)
+
+
+class TestPeriodicScanRespectsProjectsDir(unittest.TestCase):
+    """CLI の --projects-dir が定期スキャンでも尊重されることを担保。"""
+
+    def test_projects_dir_is_propagated(self):
+        import dashboard
+        import scanner
+
+        captured = []
+
+        class _Stop(BaseException):
+            """except Exception ではキャッチされず 1 周で抜けるためのマーカー。"""
+
+        def fake_scan(projects_dir=None, verbose=True):
+            captured.append({"projects_dir": projects_dir, "verbose": verbose})
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard.time.sleep
+        scanner.scan = fake_scan
+        dashboard.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard._periodic_scan_loop(1, projects_dir="/custom/path")
+        finally:
+            scanner.scan = orig_scan
+            dashboard.time.sleep = orig_sleep
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["projects_dir"], "/custom/path")
+        self.assertFalse(captured[0]["verbose"])
+
+    def test_projects_dir_none_when_not_specified(self):
+        import dashboard
+        import scanner
+
+        captured = []
+
+        class _Stop(BaseException):
+            pass
+
+        def fake_scan(projects_dir=None, verbose=True):
+            captured.append(projects_dir)
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard.time.sleep
+        scanner.scan = fake_scan
+        dashboard.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard._periodic_scan_loop(1)
+        finally:
+            scanner.scan = orig_scan
+            dashboard.time.sleep = orig_sleep
+
+        self.assertEqual(captured, [None])
+
+
+class TestResolveScanInterval(unittest.TestCase):
+    """SCAN_INTERVAL_SEC のパース失敗でサーバーが落ちないことを担保。"""
+
+    def setUp(self):
+        self._orig = os.environ.pop("SCAN_INTERVAL_SEC", None)
+
+    def tearDown(self):
+        if self._orig is not None:
+            os.environ["SCAN_INTERVAL_SEC"] = self._orig
+        else:
+            os.environ.pop("SCAN_INTERVAL_SEC", None)
+
+    def test_explicit_value_wins(self):
+        self.assertEqual(_resolve_scan_interval(60), 60)
+        # None 以外が来たらそのまま通す（0 = 無効化もそのまま通す）
+        self.assertEqual(_resolve_scan_interval(0), 0)
+
+    def test_default_when_env_missing(self):
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
+
+    def test_env_integer_parsed(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "120"
+        self.assertEqual(_resolve_scan_interval(None), 120)
+
+    def test_env_invalid_falls_back(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "300s"
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
+
+    def test_env_garbage_falls_back(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "not-a-number"
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
 
 
 class TestPricingParity(unittest.TestCase):

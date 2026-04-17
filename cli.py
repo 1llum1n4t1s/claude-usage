@@ -280,7 +280,9 @@ def cmd_dashboard(projects_dir=None, no_browser=False):
 
     # --no-browser CLI フラグ、または NO_BROWSER 環境変数でブラウザ自動起動を抑止。
     # PC 起動時のタスクから実行する場合にブラウザが毎回開くのを防ぐ。
-    skip_browser = no_browser or bool(os.environ.get("NO_BROWSER"))
+    # Python では `"0"` や `"false"` も真と評価されるので、値での判定はせず
+    # 「定義されていれば抑止」のセマンティクスにする（未設定なら None を返す）。
+    skip_browser = no_browser or os.environ.get("NO_BROWSER") is not None
 
     if not skip_browser:
         def open_browser():
@@ -292,7 +294,8 @@ def cmd_dashboard(projects_dir=None, no_browser=False):
     else:
         print(f"(Browser auto-open disabled. Open http://{host}:{port} manually.)")
 
-    serve(host=host, port=port)
+    # 定期スキャンでも CLI で指定した projects_dir を尊重する
+    serve(host=host, port=port, projects_dir=projects_dir)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

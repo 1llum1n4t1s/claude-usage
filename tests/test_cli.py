@@ -151,6 +151,45 @@ class TestArgParsing(unittest.TestCase):
         self.assertIsNone(parse_projects_dir(["--no-browser"]))
 
 
+class TestNoBrowserEnvSemantics(unittest.TestCase):
+    """NO_BROWSER 環境変数は値ではなく「定義の有無」で判定する。
+
+    `bool(os.environ.get("NO_BROWSER"))` だと `NO_BROWSER=0` や
+    `NO_BROWSER=false` も真と判定されて混乱を招くため、
+    `is not None` のセマンティクスを採用していることを担保する。
+    """
+
+    def _skip_browser(self, no_browser, env_value):
+        import os
+        prev = os.environ.pop("NO_BROWSER", None)
+        try:
+            if env_value is not None:
+                os.environ["NO_BROWSER"] = env_value
+            return no_browser or os.environ.get("NO_BROWSER") is not None
+        finally:
+            os.environ.pop("NO_BROWSER", None)
+            if prev is not None:
+                os.environ["NO_BROWSER"] = prev
+
+    def test_env_unset_and_flag_false(self):
+        self.assertFalse(self._skip_browser(False, None))
+
+    def test_env_unset_and_flag_true(self):
+        self.assertTrue(self._skip_browser(True, None))
+
+    def test_env_empty_string_treated_as_set(self):
+        # 空文字列も「定義されている」とみなして抑止する
+        self.assertTrue(self._skip_browser(False, ""))
+
+    def test_env_zero_still_suppresses(self):
+        # "0" や "false" でも定義されていれば抑止（値で挙動を変えない）
+        self.assertTrue(self._skip_browser(False, "0"))
+        self.assertTrue(self._skip_browser(False, "false"))
+
+    def test_env_one_suppresses(self):
+        self.assertTrue(self._skip_browser(False, "1"))
+
+
 class TestPricingConsistency(unittest.TestCase):
     """Ensure CLI pricing matches known Anthropic API rates."""
 

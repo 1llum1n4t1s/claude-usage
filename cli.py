@@ -264,7 +264,7 @@ def cmd_stats():
     conn.close()
 
 
-def cmd_dashboard(projects_dir=None):
+def cmd_dashboard(projects_dir=None, no_browser=False):
     import webbrowser
     import threading
     import time
@@ -278,12 +278,20 @@ def cmd_dashboard(projects_dir=None):
     host = os.environ.get("HOST", "localhost")
     port = int(os.environ.get("PORT", "8080"))
 
-    def open_browser():
-        time.sleep(1.0)
-        webbrowser.open(f"http://{host}:{port}")
+    # --no-browser CLI フラグ、または NO_BROWSER 環境変数でブラウザ自動起動を抑止。
+    # PC 起動時のタスクから実行する場合にブラウザが毎回開くのを防ぐ。
+    skip_browser = no_browser or bool(os.environ.get("NO_BROWSER"))
 
-    t = threading.Thread(target=open_browser, daemon=True)
-    t.start()
+    if not skip_browser:
+        def open_browser():
+            time.sleep(1.0)
+            webbrowser.open(f"http://{host}:{port}")
+
+        t = threading.Thread(target=open_browser, daemon=True)
+        t.start()
+    else:
+        print(f"(Browser auto-open disabled. Open http://{host}:{port} manually.)")
+
     serve(host=host, port=port)
 
 
@@ -296,7 +304,9 @@ Usage:
   python cli.py scan [--projects-dir PATH]   Scan JSONL files and update database
   python cli.py today                        Show today's usage summary
   python cli.py stats                        Show all-time statistics
-  python cli.py dashboard [--projects-dir PATH]  Scan + start dashboard
+  python cli.py dashboard [--projects-dir PATH] [--no-browser]
+                                             Scan + start dashboard
+                                             --no-browser: skip auto-opening the browser
 """
 
 COMMANDS = {
@@ -313,6 +323,10 @@ def parse_projects_dir(args):
             return args[i + 1]
     return None
 
+def parse_no_browser(args):
+    """--no-browser フラグがあるかを判定。"""
+    return "--no-browser" in args
+
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(USAGE)
@@ -320,8 +334,16 @@ if __name__ == "__main__":
 
     command = sys.argv[1]
     projects_dir = parse_projects_dir(sys.argv[2:])
+    no_browser = parse_no_browser(sys.argv[2:])
 
-    if command in ("scan", "dashboard") and projects_dir:
-        COMMANDS[command](projects_dir=projects_dir)
+    if command == "dashboard":
+        kwargs = {}
+        if projects_dir:
+            kwargs["projects_dir"] = projects_dir
+        if no_browser:
+            kwargs["no_browser"] = True
+        cmd_dashboard(**kwargs)
+    elif command == "scan" and projects_dir:
+        cmd_scan(projects_dir=projects_dir)
     else:
         COMMANDS[command]()

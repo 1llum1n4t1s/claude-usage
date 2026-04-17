@@ -1,7 +1,7 @@
 """Tests for cli.py - pricing, formatting, and cost calculation."""
 
 import unittest
-from cli import get_pricing, calc_cost, fmt, fmt_cost, PRICING
+from cli import get_pricing, calc_cost, fmt, fmt_cost, PRICING, parse_projects_dir, parse_no_browser
 
 
 class TestGetPricing(unittest.TestCase):
@@ -128,6 +128,27 @@ class TestFmtCost(unittest.TestCase):
         self.assertEqual(fmt_cost(3.0), "$3.0000")
         self.assertEqual(fmt_cost(0.0001), "$0.0001")
         self.assertEqual(fmt_cost(0), "$0.0000")
+
+
+class TestArgParsing(unittest.TestCase):
+    def test_parse_no_browser_flag_present(self):
+        self.assertTrue(parse_no_browser(["--no-browser"]))
+        self.assertTrue(parse_no_browser(["--projects-dir", "/tmp", "--no-browser"]))
+
+    def test_parse_no_browser_flag_absent(self):
+        self.assertFalse(parse_no_browser([]))
+        self.assertFalse(parse_no_browser(["--projects-dir", "/tmp"]))
+
+    def test_parse_projects_dir_present(self):
+        self.assertEqual(parse_projects_dir(["--projects-dir", "/foo"]), "/foo")
+        self.assertEqual(
+            parse_projects_dir(["--no-browser", "--projects-dir", "/foo"]),
+            "/foo",
+        )
+
+    def test_parse_projects_dir_absent(self):
+        self.assertIsNone(parse_projects_dir([]))
+        self.assertIsNone(parse_projects_dir(["--no-browser"]))
 
 
 class TestPricingConsistency(unittest.TestCase):

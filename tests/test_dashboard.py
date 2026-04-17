@@ -141,6 +141,24 @@ class TestDashboardHTTP(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
 
+    def test_index_with_query_string_returns_html(self):
+        """URL に ?range=7d のようなクエリが付いてリロードしても 200 になる。"""
+        url = f"http://127.0.0.1:{self.port}/?range=7d"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+
+    def test_index_with_multiple_params_returns_html(self):
+        url = f"http://127.0.0.1:{self.port}/?range=30d&models=claude-sonnet-4-6"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+
+    def test_api_data_with_query_string(self):
+        url = f"http://127.0.0.1:{self.port}/api/data?t=123"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("application/json", resp.headers["Content-Type"])
+
 
 class TestHTMLTemplate(unittest.TestCase):
     def test_template_is_valid_html(self):

@@ -1,5 +1,6 @@
 # Claude Code Usage Dashboard
 
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg?style=flat-square)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
@@ -71,6 +72,11 @@ python cli.py stats
 # Scan + open browser dashboard at http://localhost:8080
 python cli.py dashboard
 
+# Dashboard without auto-opening the browser (useful for startup scripts)
+python cli.py dashboard --no-browser
+# Or via environment variable
+NO_BROWSER=1 python cli.py dashboard
+
 # Custom host and port via environment variables
 HOST=0.0.0.0 PORT=9000 python cli.py dashboard
 
@@ -79,6 +85,8 @@ python cli.py scan --projects-dir /path/to/transcripts
 ```
 
 The scanner is incremental — it tracks each file's path and modification time, so re-running `scan` is fast and only processes new or changed files.
+
+While the dashboard is running, the scanner re-runs automatically in the background (default: every 300 seconds) so that the UI keeps picking up newly written JSONL transcripts without a manual refresh. Adjust or disable with `SCAN_INTERVAL_SEC=60 python cli.py dashboard` (set to `0` to disable).
 
 By default, the scanner checks both `~/.claude/projects/` and the Xcode Claude integration directory (`~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/projects/`), skipping any that don't exist. Use `--projects-dir` to scan a custom location instead.
 

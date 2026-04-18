@@ -23,6 +23,13 @@ DEFAULT_SCAN_INTERVAL_SEC = 300
 _cache_key = None
 _cache_data = None
 
+# 定期スキャン(バックグラウンドスレッド)と /api/rescan(HTTP リクエスト)が
+# 同時に scan() を呼ぶと SQLite が同時書き込みで OperationalError を
+# 起こしたり、/api/rescan 側の DB_PATH.unlink() が writer 進行中に
+# 実行されてレースする可能性がある。両エントリポイントを同じロックで
+# 直列化することで DB 操作を常に1つだけに抑える。
+_scan_lock = threading.Lock()
+
 
 def _invalidate_cache():
     """定期スキャン後などに呼び出してキャッシュを破棄。"""
@@ -1424,11 +1431,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/api/rescan":
-            if DB_PATH.exists():
-                DB_PATH.unlink()
             from scanner import scan
-            result = scan(verbose=False)
-            _invalidate_cache()
+            # バックグラウンド定期スキャンと直列化することで、
+            # DB_PATH.unlink() が走行中の writer と競合するのを防ぐ。
+            with _scan_lock:
+                if DB_PATH.exists():
+                    DB_PATH.unlink()
+                # WAL/SHM のサイドファイルも残骸として残ると壊れた状態に
+                # 見えるので、本体を消すタイミングで一緒に掃除する。
+                for suffix in ("-wal", "-shm"):
+                    side = DB_PATH.with_name(DB_PATH.name + suffix)
+                    if side.exists():
+                        try:
+                            side.unlink()
+                        except OSError:
+                            pass
+                result = scan(verbose=False)
+                _invalidate_cache()
             self._send_json(result)
         else:
             self.send_response(404)
@@ -1451,8 +1470,10 @@ def _periodic_scan_loop(interval_sec, projects_dir=None):
     while True:
         try:
             time.sleep(interval_sec)
-            scan(projects_dir=projects_dir, verbose=False)
-            _invalidate_cache()
+            # 手動 /api/rescan と直列化。先方が走行中ならブロックして待つ。
+            with _scan_lock:
+                scan(projects_dir=projects_dir, verbose=False)
+                _invalidate_cache()
         except Exception as exc:
             # サーバーは落とさず、次の周期で再挑戦する
             print(f"[periodic scan error] {exc}")

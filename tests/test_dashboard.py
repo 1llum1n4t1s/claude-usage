@@ -10,11 +10,13 @@ import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
+import dashboard as dashboard_module
 from dashboard import (
     get_dashboard_data,
     DashboardHandler,
     HTML_TEMPLATE,
     _resolve_scan_interval,
+    _scan_lock,
     DEFAULT_SCAN_INTERVAL_SEC,
 )
 
@@ -245,6 +247,83 @@ class TestPeriodicScanRespectsProjectsDir(unittest.TestCase):
             dashboard.time.sleep = orig_sleep
 
         self.assertEqual(captured, [None])
+
+
+class TestScanSerialization(unittest.TestCase):
+    """定期スキャンと /api/rescan が同じロックで直列化されることを担保。
+
+    両エントリポイント (``_periodic_scan_loop`` と ``DashboardHandler.do_POST``)
+    は同一のモジュールロック ``_scan_lock`` を使って ``scan()`` を
+    ``with _scan_lock:`` で保護している。本テストは、そのロックが実際に
+    同時実行を阻止することを確認する。
+    """
+
+    def test_scan_lock_is_a_lock(self):
+        self.assertTrue(hasattr(_scan_lock, "acquire"))
+        self.assertTrue(hasattr(_scan_lock, "release"))
+
+    def test_concurrent_scans_are_serialized(self):
+        import time as _time
+
+        state = {"current": 0, "max": 0}
+        counter_lock = threading.Lock()
+        total_calls = {"n": 0}
+
+        def instrumented():
+            with counter_lock:
+                state["current"] += 1
+                state["max"] = max(state["max"], state["current"])
+                total_calls["n"] += 1
+            # 他スレッドが並行突入できるだけの時間、ロックを保持
+            _time.sleep(0.05)
+            with counter_lock:
+                state["current"] -= 1
+
+        def worker():
+            # dashboard.py と同じイディオムで保護して scan 相当処理を走らせる
+            with _scan_lock:
+                instrumented()
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(total_calls["n"], 4)
+        self.assertEqual(state["max"], 1,
+                         "共通ロックが効いていない: scan 相当処理が並行実行された")
+
+    def test_periodic_loop_acquires_scan_lock(self):
+        """_periodic_scan_loop 内の scan 呼び出しは _scan_lock 保護下で走る。"""
+        import scanner
+
+        lock_states = []
+
+        class _Stop(BaseException):
+            pass
+
+        def fake_scan(projects_dir=None, verbose=True):
+            # scan 実行中はロックが保持されているはず (acquire() すると False)
+            acquired = _scan_lock.acquire(blocking=False)
+            lock_states.append(acquired)
+            if acquired:
+                _scan_lock.release()
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard_module.time.sleep
+        scanner.scan = fake_scan
+        dashboard_module.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard_module._periodic_scan_loop(1)
+        finally:
+            scanner.scan = orig_scan
+            dashboard_module.time.sleep = orig_sleep
+
+        self.assertEqual(lock_states, [False],
+                         "_periodic_scan_loop が scan 呼び出し時にロックを保持していない")
 
 
 class TestResolveScanInterval(unittest.TestCase):

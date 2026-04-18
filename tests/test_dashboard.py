@@ -10,7 +10,15 @@ import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+import dashboard as dashboard_module
+from dashboard import (
+    get_dashboard_data,
+    DashboardHandler,
+    HTML_TEMPLATE,
+    _resolve_scan_interval,
+    _scan_lock,
+    DEFAULT_SCAN_INTERVAL_SEC,
+)
 
 try:
     from http.server import HTTPServer
@@ -141,6 +149,24 @@ class TestDashboardHTTP(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
 
+    def test_index_with_query_string_returns_html(self):
+        """URL に ?range=7d のようなクエリが付いてリロードしても 200 になる。"""
+        url = f"http://127.0.0.1:{self.port}/?range=7d"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+
+    def test_index_with_multiple_params_returns_html(self):
+        url = f"http://127.0.0.1:{self.port}/?range=30d&models=claude-sonnet-4-6"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+
+    def test_api_data_with_query_string(self):
+        url = f"http://127.0.0.1:{self.port}/api/data?t=123"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("application/json", resp.headers["Content-Type"])
+
 
 class TestHTMLTemplate(unittest.TestCase):
     def test_template_is_valid_html(self):
@@ -163,6 +189,174 @@ class TestHTMLTemplate(unittest.TestCase):
     def test_unknown_models_return_null(self):
         """Verify getPricing returns null for non-Anthropic models."""
         self.assertIn("return null;", HTML_TEMPLATE)
+
+
+class TestPeriodicScanRespectsProjectsDir(unittest.TestCase):
+    """CLI の --projects-dir が定期スキャンでも尊重されることを担保。"""
+
+    def test_projects_dir_is_propagated(self):
+        import dashboard
+        import scanner
+
+        captured = []
+
+        class _Stop(BaseException):
+            """except Exception ではキャッチされず 1 周で抜けるためのマーカー。"""
+
+        def fake_scan(projects_dir=None, verbose=True):
+            captured.append({"projects_dir": projects_dir, "verbose": verbose})
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard.time.sleep
+        scanner.scan = fake_scan
+        dashboard.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard._periodic_scan_loop(1, projects_dir="/custom/path")
+        finally:
+            scanner.scan = orig_scan
+            dashboard.time.sleep = orig_sleep
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["projects_dir"], "/custom/path")
+        self.assertFalse(captured[0]["verbose"])
+
+    def test_projects_dir_none_when_not_specified(self):
+        import dashboard
+        import scanner
+
+        captured = []
+
+        class _Stop(BaseException):
+            pass
+
+        def fake_scan(projects_dir=None, verbose=True):
+            captured.append(projects_dir)
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard.time.sleep
+        scanner.scan = fake_scan
+        dashboard.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard._periodic_scan_loop(1)
+        finally:
+            scanner.scan = orig_scan
+            dashboard.time.sleep = orig_sleep
+
+        self.assertEqual(captured, [None])
+
+
+class TestScanSerialization(unittest.TestCase):
+    """定期スキャンと /api/rescan が同じロックで直列化されることを担保。
+
+    両エントリポイント (``_periodic_scan_loop`` と ``DashboardHandler.do_POST``)
+    は同一のモジュールロック ``_scan_lock`` を使って ``scan()`` を
+    ``with _scan_lock:`` で保護している。本テストは、そのロックが実際に
+    同時実行を阻止することを確認する。
+    """
+
+    def test_scan_lock_is_a_lock(self):
+        self.assertTrue(hasattr(_scan_lock, "acquire"))
+        self.assertTrue(hasattr(_scan_lock, "release"))
+
+    def test_concurrent_scans_are_serialized(self):
+        import time as _time
+
+        state = {"current": 0, "max": 0}
+        counter_lock = threading.Lock()
+        total_calls = {"n": 0}
+
+        def instrumented():
+            with counter_lock:
+                state["current"] += 1
+                state["max"] = max(state["max"], state["current"])
+                total_calls["n"] += 1
+            # 他スレッドが並行突入できるだけの時間、ロックを保持
+            _time.sleep(0.05)
+            with counter_lock:
+                state["current"] -= 1
+
+        def worker():
+            # dashboard.py と同じイディオムで保護して scan 相当処理を走らせる
+            with _scan_lock:
+                instrumented()
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(total_calls["n"], 4)
+        self.assertEqual(state["max"], 1,
+                         "共通ロックが効いていない: scan 相当処理が並行実行された")
+
+    def test_periodic_loop_acquires_scan_lock(self):
+        """_periodic_scan_loop 内の scan 呼び出しは _scan_lock 保護下で走る。"""
+        import scanner
+
+        lock_states = []
+
+        class _Stop(BaseException):
+            pass
+
+        def fake_scan(projects_dir=None, verbose=True):
+            # scan 実行中はロックが保持されているはず (acquire() すると False)
+            acquired = _scan_lock.acquire(blocking=False)
+            lock_states.append(acquired)
+            if acquired:
+                _scan_lock.release()
+            raise _Stop()
+
+        orig_scan = scanner.scan
+        orig_sleep = dashboard_module.time.sleep
+        scanner.scan = fake_scan
+        dashboard_module.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(_Stop):
+                dashboard_module._periodic_scan_loop(1)
+        finally:
+            scanner.scan = orig_scan
+            dashboard_module.time.sleep = orig_sleep
+
+        self.assertEqual(lock_states, [False],
+                         "_periodic_scan_loop が scan 呼び出し時にロックを保持していない")
+
+
+class TestResolveScanInterval(unittest.TestCase):
+    """SCAN_INTERVAL_SEC のパース失敗でサーバーが落ちないことを担保。"""
+
+    def setUp(self):
+        self._orig = os.environ.pop("SCAN_INTERVAL_SEC", None)
+
+    def tearDown(self):
+        if self._orig is not None:
+            os.environ["SCAN_INTERVAL_SEC"] = self._orig
+        else:
+            os.environ.pop("SCAN_INTERVAL_SEC", None)
+
+    def test_explicit_value_wins(self):
+        self.assertEqual(_resolve_scan_interval(60), 60)
+        # None 以外が来たらそのまま通す（0 = 無効化もそのまま通す）
+        self.assertEqual(_resolve_scan_interval(0), 0)
+
+    def test_default_when_env_missing(self):
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
+
+    def test_env_integer_parsed(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "120"
+        self.assertEqual(_resolve_scan_interval(None), 120)
+
+    def test_env_invalid_falls_back(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "300s"
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
+
+    def test_env_garbage_falls_back(self):
+        os.environ["SCAN_INTERVAL_SEC"] = "not-a-number"
+        self.assertEqual(_resolve_scan_interval(None), DEFAULT_SCAN_INTERVAL_SEC)
 
 
 class TestPricingParity(unittest.TestCase):

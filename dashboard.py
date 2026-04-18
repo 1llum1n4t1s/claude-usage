@@ -4,17 +4,38 @@ dashboard.py - Local web dashboard served on localhost:8080.
 
 import json
 import os
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 from scanner import get_db
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+# バックグラウンド自動スキャンの既定間隔（秒）。
+# SCAN_INTERVAL_SEC=0 で無効化、環境変数で上書き可能。
+DEFAULT_SCAN_INTERVAL_SEC = 300
 
 # /api/data 用の軽量キャッシュ: TTL + DB mtime でキー管理。
 # 連続アクセス時の重い SQL 集約をスキップ。
 _cache_key = None
 _cache_data = None
+
+# 定期スキャン(バックグラウンドスレッド)と /api/rescan(HTTP リクエスト)が
+# 同時に scan() を呼ぶと SQLite が同時書き込みで OperationalError を
+# 起こしたり、/api/rescan 側の DB_PATH.unlink() が writer 進行中に
+# 実行されてレースする可能性がある。両エントリポイントを同じロックで
+# 直列化することで DB 操作を常に1つだけに抑える。
+_scan_lock = threading.Lock()
+
+
+def _invalidate_cache():
+    """定期スキャン後などに呼び出してキャッシュを破棄。"""
+    global _cache_key, _cache_data
+    _cache_key = None
+    _cache_data = None
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -1386,13 +1407,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        # `self.path` はクエリ・フラグメント込み。`/?range=7d` のような
+        # リロードで 404 にならないよう、urlparse でパス部分のみ抽出して比較する。
+        path = urlparse(self.path).path
+
+        if path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
-        elif self.path == "/api/data":
+        elif path == "/api/data":
             try:
                 self._send_json(get_dashboard_data())
             except Exception as exc:
@@ -1403,19 +1428,93 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/rescan":
-            if DB_PATH.exists():
-                DB_PATH.unlink()
+        path = urlparse(self.path).path
+
+        if path == "/api/rescan":
             from scanner import scan
-            self._send_json(scan(verbose=False))
+            # バックグラウンド定期スキャンと直列化することで、
+            # DB_PATH.unlink() が走行中の writer と競合するのを防ぐ。
+            with _scan_lock:
+                if DB_PATH.exists():
+                    DB_PATH.unlink()
+                # WAL/SHM のサイドファイルも残骸として残ると壊れた状態に
+                # 見えるので、本体を消すタイミングで一緒に掃除する。
+                for suffix in ("-wal", "-shm"):
+                    side = DB_PATH.with_name(DB_PATH.name + suffix)
+                    if side.exists():
+                        try:
+                            side.unlink()
+                        except OSError:
+                            pass
+                result = scan(verbose=False)
+                _invalidate_cache()
+            self._send_json(result)
         else:
             self.send_response(404)
             self.end_headers()
 
 
-def serve(host=None, port=None):
+def _periodic_scan_loop(interval_sec, projects_dir=None):
+    """バックグラウンドで定期的に scan を走らせ、キャッシュを破棄する。
+
+    PC 起動時しかスキャンしていなかったため、日をまたぐと当日の統計が
+    反映されなかった。ダッシュボード稼働中も自動で最新 JSONL を取り込む。
+
+    projects_dir: CLI で ``--projects-dir`` が指定された場合、初回 scan と
+    同じディレクトリを周期スキャンでも使う。None ならスキャナー既定値
+    (``DEFAULT_PROJECTS_DIRS``) を利用。
+    """
+    # scanner のインポートはスレッド内で行って起動時間を早める
+    from scanner import scan
+
+    while True:
+        try:
+            time.sleep(interval_sec)
+            # 手動 /api/rescan と直列化。先方が走行中ならブロックして待つ。
+            with _scan_lock:
+                scan(projects_dir=projects_dir, verbose=False)
+                _invalidate_cache()
+        except Exception as exc:
+            # サーバーは落とさず、次の周期で再挑戦する
+            print(f"[periodic scan error] {exc}")
+
+
+def _resolve_scan_interval(scan_interval_sec):
+    """SCAN_INTERVAL_SEC のパースを失敗に強くする。
+
+    `"300s"` のような不正値でもサーバーを落とさず、デフォルト値に
+    フォールバックする。
+    """
+    if scan_interval_sec is not None:
+        return scan_interval_sec
+    raw = os.environ.get("SCAN_INTERVAL_SEC", str(DEFAULT_SCAN_INTERVAL_SEC))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        print(f"[warn] invalid SCAN_INTERVAL_SEC={raw!r}; "
+              f"falling back to {DEFAULT_SCAN_INTERVAL_SEC}s")
+        return DEFAULT_SCAN_INTERVAL_SEC
+
+
+def serve(host=None, port=None, scan_interval_sec=None, projects_dir=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
+
+    scan_interval_sec = _resolve_scan_interval(scan_interval_sec)
+
+    if scan_interval_sec > 0:
+        t = threading.Thread(
+            target=_periodic_scan_loop,
+            args=(scan_interval_sec,),
+            kwargs={"projects_dir": projects_dir},
+            daemon=True,
+            name="claude-usage-periodic-scan",
+        )
+        t.start()
+        print(f"Periodic scan enabled: every {scan_interval_sec}s")
+    else:
+        print("Periodic scan disabled (SCAN_INTERVAL_SEC=0)")
+
     server = HTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
